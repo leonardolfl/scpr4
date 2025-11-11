@@ -5,22 +5,28 @@ import { chromium, devices } from "playwright";
 import { supabase } from "./supabase.js";
 
 /**
- * scraper.mjs (selector-first, resource-blocking, 1 retry)
+ * scraper.mjs (improved: selector-first + extension-method fallback, attempts handling)
+ *
+ * Instrução SQL recomendada (execute no Supabase SQL editor para adicionar coluna attempts):
+ *   ALTER TABLE swipe_file_offers ADD COLUMN IF NOT EXISTS attempts integer DEFAULT 0;
+ *
+ * Recursos principais:
  * - Mantém chunking por WORKER_INDEX e atualizações status_updated
  * - Device pool + UA rotation
  * - Abort imagens, stylesheets, fonts e media para reduzir HTML carregado
- * - Usa selector/text regex para extrair contador (resultados|results)
- * - Se não encontrar, faz 1 retry antes de marcar no_counter
+ * - Usa selector/text regex como tentativa rápida, e em fallback injeta função idêntica
+ *   à da extensão (document.querySelector('div[role="heading"][aria-level="3"]'))
+ * - Normaliza número, parseInt e atualização segura no DB com attempts
  *
  * ENV:
  * - WORKER_INDEX (injetado pelo workflow)
  * - TOTAL_WORKERS (default 4)
  * - PROCESS_LIMIT (opcional)
  * - PARALLEL (default 3)
- * - WAIT_TIME (ms) default 7000   -> tempo adicional após goto (ainda usado)
+ * - WAIT_TIME (ms) default 7000
  * - NAV_TIMEOUT (ms) default 60000
- * - SELECTOR_TIMEOUT (ms) default 15000  -> tempo para waitForSelector
- * - RETRY_ATTEMPTS (number of extra retries when selector not found) default 1
+ * - SELECTOR_TIMEOUT (ms) default 15000
+ * - RETRY_ATTEMPTS (number of extra retries when selector not found) default 2
  * - DEBUG_DIR default ./debug
  * - WORKER_ID optional
  */
@@ -32,9 +38,13 @@ let PARALLEL = Math.max(1, parseInt(process.env.PARALLEL || "3", 10));
 const WAIT_TIME = parseInt(process.env.WAIT_TIME || "7000", 10);
 const NAV_TIMEOUT = parseInt(process.env.NAV_TIMEOUT || "60000", 10);
 const SELECTOR_TIMEOUT = parseInt(process.env.SELECTOR_TIMEOUT || "15000", 10);
-const RETRY_ATTEMPTS = Math.max(0, parseInt(process.env.RETRY_ATTEMPTS || "1", 10)); // number of retries when selector not found
+// Atualizado para 2 por padrão (configurável via env)
+const RETRY_ATTEMPTS = Math.max(0, parseInt(process.env.RETRY_ATTEMPTS || "2", 10)); // number of retries when selector not found
 const DEBUG_DIR = process.env.DEBUG_DIR || "./debug";
 const WORKER_ID = process.env.WORKER_ID || `${os.hostname()}-${process.pid}-${Date.now()}`;
+
+// Quantas falhas consecutivas antes de marcar activeAds = null permanentemente
+const MAX_FAILS = parseInt(process.env.MAX_FAILS || "3", 10);
 
 const DEVICE_NAMES = [
   "iPhone 13 Pro Max",
@@ -123,6 +133,49 @@ function parseCountFromText(text) {
   return null;
 }
 
+/**
+ * Função in-page a ser injetada como fallback.
+ * Copiada/Adaptada do método que funciona na extensão (background.js -> getPageDetailsAndAdCountInjectedForBackground)
+ * Mantém foco em: document.querySelector('div[role="heading"][aria-level="3"]')
+ */
+function injectedGetPageDetailsAndAdCountForEvaluate(offerNameToUse) {
+  // esta função roda no contexto da página; quando serializada via page.evaluate, tudo aqui é convertido para texto
+  const nameElement = document.querySelector('div[role="heading"][aria-level="1"]');
+  const advertiserName = nameElement ? nameElement.innerText.trim() : 'Unknown';
+  let adCount = null;
+  let extractedSuccessfully = false;
+  let rawText = null;
+
+  const adCountElement = document.querySelector('div[role="heading"][aria-level="3"]');
+  if (adCountElement && adCountElement.innerText) {
+    const textContent = adCountElement.innerText;
+    rawText = textContent;
+    // Primeiro tenta "~1,2k" ou "~123,4"
+    let match = textContent.match(/~([0-9.,]+)/);
+    if (!match) {
+      // Fallback para "123 resultados" ou "123 results"
+      match = textContent.match(/([\d,.]+)\s*(resultados|results)/i);
+    }
+    if (match && match[1]) {
+      // Normaliza removendo separadores (ponto/virgula)
+      const numberString = match[1].replace(/[.,]/g, '');
+      const parsedCount = parseInt(numberString, 10);
+      if (!isNaN(parsedCount)) {
+        adCount = parsedCount;
+        extractedSuccessfully = true;
+      }
+    }
+  }
+
+  return {
+    name: advertiserName,
+    results: adCount,
+    offer: offerNameToUse,
+    extractedSuccessfully,
+    rawText
+  };
+}
+
 // Main processing
 async function processOffers(offersSlice) {
   const browser = await chromium.launch({ headless: true });
@@ -160,6 +213,7 @@ async function processOffers(offersSlice) {
 
         // Try selector-first extraction, with up to RETRY_ATTEMPTS retries
         let foundCount = null;
+        let foundRawText = null;
         let attempt = 0;
         const selectorString = 'text=/' + '(\\d{1,3}(?:[.,]\\d{3})*(?:[.,]\\d+)?)\\s*(?:resultados|results)' + '/i';
         for (; attempt <= RETRY_ATTEMPTS && foundCount === null; attempt++) {
@@ -172,6 +226,7 @@ async function processOffers(offersSlice) {
               const parsed = parseCountFromText(text);
               if (parsed != null) {
                 foundCount = parsed;
+                foundRawText = text;
                 console.log(`🔎 [${offer.id}] selector found on attempt ${attempt + 1}`);
                 break;
               }
@@ -185,31 +240,76 @@ async function processOffers(offersSlice) {
           }
         }
 
+        // If selector-first failed, use the exact method from the extension (in-page evaluate)
+        if (foundCount === null) {
+          try {
+            const evalRes = await page.evaluate(injectedGetPageDetailsAndAdCountForEvaluate, offer.offerName || "");
+            if (evalRes && evalRes.extractedSuccessfully && typeof evalRes.results === "number") {
+              foundCount = evalRes.results;
+              foundRawText = evalRes.rawText || null;
+              console.log(`🔁 [${offer.id}] fallback evaluate succeeded: ${foundCount}`);
+            } else {
+              console.log(`🔁 [${offer.id}] fallback evaluate did not find counter`);
+            }
+          } catch (e) {
+            console.warn(`⚠️ [${offer.id}] evaluate fallback failed: ${String(e?.message || e)}`);
+          }
+        }
+
         const updated_at = nowIso();
 
         if (foundCount != null) {
           const activeAds = foundCount;
-          console.log(`✅ [${offer.id}] ${offer.offerName || "offer"}: ${activeAds} anúncios`);
+          console.log(`✅ [${offer.id}] ${offer.offerName || "offer"}: ${activeAds} anúncios (raw: ${String(foundRawText).slice(0,120)})`);
+
+          // Update in DB: success -> activeAds + attempts reset
           const { error } = await supabase
             .from("swipe_file_offers")
-            .update({ activeAds, updated_at, status_updated: "success" })
+            .update({ activeAds, updated_at, status_updated: "success", attempts: 0 })
             .eq("id", offer.id);
           if (error) console.warn(`[${offer.id}] Erro ao atualizar DB:`, error.message || error);
           consecutiveSuccess++;
           consecutiveFails = 0;
         } else {
-          console.warn(`❌ [${offer.id}] contador não encontrado pelo selector após ${RETRY_ATTEMPTS + 1} tentativas — salvando debug`);
+          console.warn(`❌ [${offer.id}] contador não encontrado após selector+fallback — salvando debug`);
+
+          // Save debug snapshot for inspection
           try {
-            const dbg = await saveDebug(page, offer.id, "no-counter-selector");
+            const dbg = await saveDebug(page, offer.id, "no-counter-selector-and-fallback");
             console.log(`[${offer.id}] debug salvo: ${dbg.htmlPath || "no-html"} ${dbg.pngPath || ""}`);
           } catch (e) {
             console.warn(`[${offer.id}] falha ao salvar debug:`, e?.message || e);
           }
-          await supabase
-            .from("swipe_file_offers")
-            .update({ activeAds: null, updated_at, status_updated: "no_counter" })
-            .eq("id", offer.id)
-            .catch((e) => console.warn(`[${offer.id}] DB update (no_counter) error:`, e?.message || e));
+
+          // Determine current attempts (prefer using value from the fetched offer)
+          const currentAttempts = Number(offer.attempts ?? 0);
+          const newAttempts = currentAttempts + 1;
+
+          // If attempts reached MAX_FAILS, mark activeAds = null final; otherwise only increment attempts and mark attempt status
+          if (newAttempts >= MAX_FAILS) {
+            try {
+              const { error } = await supabase
+                .from("swipe_file_offers")
+                .update({ activeAds: null, updated_at, status_updated: "no_counter", attempts: newAttempts })
+                .eq("id", offer.id);
+              if (error) console.warn(`[${offer.id}] DB update (no_counter) error:`, error.message || error);
+              console.log(`[${offer.id}] marcação final no_counter após ${newAttempts} tentativas`);
+            } catch (e) {
+              console.warn(`[${offer.id}] Erro ao gravar no_counter:`, e?.message || e);
+            }
+          } else {
+            try {
+              const { error } = await supabase
+                .from("swipe_file_offers")
+                .update({ updated_at, status_updated: `no_counter_attempt_${newAttempts}`, attempts: newAttempts })
+                .eq("id", offer.id);
+              if (error) console.warn(`[${offer.id}] DB update (attempt increment) error:`, error.message || error);
+              console.log(`[${offer.id}] incrementado attempts -> ${newAttempts} (não sobrescrevendo activeAds)`);
+            } catch (e) {
+              console.warn(`[${offer.id}] Erro ao incrementar attempts:`, e?.message || e);
+            }
+          }
+
           consecutiveFails++;
         }
       } catch (err) {
@@ -225,10 +325,20 @@ async function processOffers(offersSlice) {
           console.warn(`[${offer.id}] falha ao salvar debug na exception:`, e?.message || e);
         }
         try {
-          await supabase
-            .from("swipe_file_offers")
-            .update({ activeAds: null, updated_at: nowIso(), status_updated: "error" })
-            .eq("id", offer.id);
+          // On exception we increment attempts similar to no-counter flow (avoid immediate null)
+          const currentAttempts = Number(offer.attempts ?? 0);
+          const newAttempts = currentAttempts + 1;
+          if (newAttempts >= MAX_FAILS) {
+            await supabase
+              .from("swipe_file_offers")
+              .update({ activeAds: null, updated_at: nowIso(), status_updated: "error", attempts: newAttempts })
+              .eq("id", offer.id);
+          } else {
+            await supabase
+              .from("swipe_file_offers")
+              .update({ updated_at: nowIso(), status_updated: `error_attempt_${newAttempts}`, attempts: newAttempts })
+              .eq("id", offer.id);
+          }
         } catch (e) {
           console.warn(`[${offer.id}] DB update (error) failed:`, e?.message || e);
         }
