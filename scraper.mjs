@@ -5,56 +5,58 @@ import { chromium, devices } from "playwright";
 import { supabase } from "./supabase.js";
 
 /**
- * scraper.mjs (improved: selector-first + extension-method fallback, attempts handling)
+ * scraper.mjs - optimized
  *
- * Instrução SQL recomendada (execute no Supabase SQL editor para adicionar coluna attempts):
+ * SQL recomendado (execute no Supabase SQL editor se ainda não executou):
  *   ALTER TABLE swipe_file_offers ADD COLUMN IF NOT EXISTS attempts integer DEFAULT 0;
  *
- * Recursos principais:
- * - Mantém chunking por WORKER_INDEX e atualizações status_updated
- * - Device pool + UA rotation
- * - Abort imagens, stylesheets, fonts e media para reduzir HTML carregado
- * - Usa selector/text regex como tentativa rápida, e em fallback injeta função idêntica
- *   à da extensão (document.querySelector('div[role="heading"][aria-level="3"]'))
- * - Normaliza número, parseInt e atualização segura no DB com attempts
+ * Principais otimizações:
+ * - Pool de contexts (CONTEXT_POOL_SIZE, default igual a PARALLEL)
+ * - Abordagem selector-first rápida usando heading (igual à extensão)
+ * - Fallback evaluate apenas quando necessário (lightweight)
+ * - Redução de waits/timeouts e RETRY_ATTEMPTS=1 por padrão
+ * - DEBUG flag para salvar HTML-only debug; sem screenshots
+ * - LOG_LEVEL para controlar verbosidade
  *
- * ENV:
- * - WORKER_INDEX (injetado pelo workflow)
- * - TOTAL_WORKERS (default 4)
- * - PROCESS_LIMIT (opcional)
- * - PARALLEL (default 3)
- * - WAIT_TIME (ms) default 7000
- * - NAV_TIMEOUT (ms) default 60000
- * - SELECTOR_TIMEOUT (ms) default 15000
- * - RETRY_ATTEMPTS (number of extra retries when selector not found) default 2
- * - DEBUG_DIR default ./debug
- * - WORKER_ID optional
+ * ENV usados:
+ * WORKER_INDEX, TOTAL_WORKERS, PROCESS_LIMIT
+ * PARALLEL (default 4)
+ * CONTEXT_POOL_SIZE (default = PARALLEL)
+ * WAIT_TIME (ms) default 2500
+ * NAV_TIMEOUT (ms) default 45000
+ * SELECTOR_TIMEOUT (ms) default 8000
+ * RETRY_ATTEMPTS default 1
+ * DEBUG default "false" (quando true salva HTML debug)
+ * LOG_LEVEL default "info" (info|warn|error|silent)
+ * MAX_FAILS default 3
+ * DEBUG_DIR default ./debug
  */
 
 const TOTAL_WORKERS = parseInt(process.env.TOTAL_WORKERS || "4", 10);
 const WORKER_INDEX = parseInt(process.env.WORKER_INDEX ?? "0", 10);
 const PROCESS_LIMIT = process.env.PROCESS_LIMIT ? parseInt(process.env.PROCESS_LIMIT, 10) : null;
-let PARALLEL = Math.max(1, parseInt(process.env.PARALLEL || "3", 10));
-const WAIT_TIME = parseInt(process.env.WAIT_TIME || "7000", 10);
-const NAV_TIMEOUT = parseInt(process.env.NAV_TIMEOUT || "60000", 10);
-const SELECTOR_TIMEOUT = parseInt(process.env.SELECTOR_TIMEOUT || "15000", 10);
-// Atualizado para 2 por padrão (configurável via env)
-const RETRY_ATTEMPTS = Math.max(0, parseInt(process.env.RETRY_ATTEMPTS || "2", 10)); // number of retries when selector not found
+
+const PARALLEL = Math.max(1, parseInt(process.env.PARALLEL || "4", 10));
+const CONTEXT_POOL_SIZE = Math.max(1, parseInt(process.env.CONTEXT_POOL_SIZE || String(PARALLEL), 10));
+
+const WAIT_TIME = parseInt(process.env.WAIT_TIME || "2500", 10);
+const NAV_TIMEOUT = parseInt(process.env.NAV_TIMEOUT || "45000", 10);
+const SELECTOR_TIMEOUT = parseInt(process.env.SELECTOR_TIMEOUT || "8000", 10);
+const RETRY_ATTEMPTS = Math.max(0, parseInt(process.env.RETRY_ATTEMPTS || "1", 10)); // requested default =1
+
+const DEBUG = String(process.env.DEBUG || "false").toLowerCase() === "true";
+const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase(); // info|warn|error|silent
+
+const MAX_FAILS = parseInt(process.env.MAX_FAILS || "3", 10);
+
 const DEBUG_DIR = process.env.DEBUG_DIR || "./debug";
 const WORKER_ID = process.env.WORKER_ID || `${os.hostname()}-${process.pid}-${Date.now()}`;
 
-// Quantas falhas consecutivas antes de marcar activeAds = null permanentemente
-const MAX_FAILS = parseInt(process.env.MAX_FAILS || "3", 10);
-
 const DEVICE_NAMES = [
-  "iPhone 13 Pro Max",
-  "iPhone 12",
-  "iPhone 11 Pro",
-  "Pixel 7",
-  "Pixel 5",
-  "Galaxy S21 Ultra",
-  "iPad Mini",
   "Desktop Chrome",
+  "iPhone 13 Pro Max",
+  "Pixel 7",
+  "iPad Mini",
 ];
 const DEVICE_POOL = DEVICE_NAMES.map((n) => devices[n]).filter(Boolean);
 
@@ -62,13 +64,8 @@ const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; rv:122.0) Gecko/20100101 Firefox/122.0",
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
 ];
 
-function ensureDebugDir() {
-  if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
-}
 function nowIso() {
   return new Date().toISOString();
 }
@@ -95,53 +92,66 @@ function pickDeviceAndUA(index) {
   return { device, ua };
 }
 
-async function saveDebug(pageOrHtml, offerId, note = "") {
+function logInfo(...args) {
+  if (["info"].includes(LOG_LEVEL)) console.log(...args);
+}
+function logWarn(...args) {
+  if (["info", "warn"].includes(LOG_LEVEL)) console.warn(...args);
+}
+function logError(...args) {
+  if (["info", "warn", "error"].includes(LOG_LEVEL)) console.error(...args);
+}
+
+function ensureDebugDir() {
+  if (!DEBUG) return;
+  if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
+}
+async function saveDebugHtml(htmlContent, offerId, note = "") {
+  if (!DEBUG) return null;
   try {
     ensureDebugDir();
     const ts = nowTs();
     const safe = `offer-${offerId}-${ts}`;
     const htmlPath = path.join(DEBUG_DIR, `${safe}.html`);
-    const pngPath = path.join(DEBUG_DIR, `${safe}.png`);
-    if (typeof pageOrHtml === "string") {
-      await fs.promises.writeFile(htmlPath, `<!-- ${note} -->\n` + pageOrHtml, "utf8");
-      return { htmlPath, pngPath: null };
-    } else {
-      const content = await pageOrHtml.content();
-      await fs.promises.writeFile(htmlPath, `<!-- ${note} -->\n` + content, "utf8");
-      try {
-        await pageOrHtml.screenshot({ path: pngPath, fullPage: true });
-      } catch (e) {
-        // ignore screenshot failures
-      }
-      return { htmlPath, pngPath };
-    }
+    await fs.promises.writeFile(htmlPath, `<!-- ${note} -->\n` + htmlContent, "utf8");
+    return { htmlPath };
   } catch (err) {
-    console.warn("❌ Falha ao salvar debug:", err?.message || err);
-    return { htmlPath: null, pngPath: null };
+    logWarn("❌ Falha ao salvar debug HTML:", err?.message || err);
+    return null;
   }
 }
 
-function parseCountFromText(text) {
+/**
+ * Parser seguindo lógica da extensão (foco em heading)
+ * - Recebe um texto (heading) e tenta dois padrões:
+ *   1) "~123,4" estilo aproximado -> captura número
+ *   2) "123 resultados" ou "123 results"
+ * - Normaliza removendo '.' e ',' antes do parseInt.
+ */
+function parseCountFromHeadingText(text) {
   if (!text || typeof text !== "string") return null;
-  const re = /(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?)\s*(?:resultados|results)/i;
-  const m = text.match(re);
+  // Primeiro tenta "~123,4" (aprox.)
+  let m = text.match(/~\s*([0-9,.]+)/);
+  if (!m) {
+    m = text.match(/([\d\.,\s\u00A0\u202F]+)\s*(?:resultados|results)/i);
+  }
   if (m && m[1]) {
-    const digits = m[1].replace(/[^\d]/g, "");
-    if (!digits) return null;
-    return parseInt(digits, 10);
+    // remove dots/commas/spaces
+    const cleaned = m[1].replace(/[.,\s\u00A0\u202F]/g, "");
+    const n = parseInt(cleaned, 10);
+    if (!isNaN(n)) return n;
   }
   return null;
 }
 
 /**
- * Função in-page a ser injetada como fallback.
- * Copiada/Adaptada do método que funciona na extensão (background.js -> getPageDetailsAndAdCountInjectedForBackground)
- * Mantém foco em: document.querySelector('div[role="heading"][aria-level="3"]')
+ * Função in-page para fallback (serializável)
+ * Copiada/adaptada da extensão: busca heading role=3 e aplica regexs.
+ * Retorna { name, results, extractedSuccessfully, rawText }
  */
 function injectedGetPageDetailsAndAdCountForEvaluate(offerNameToUse) {
-  // esta função roda no contexto da página; quando serializada via page.evaluate, tudo aqui é convertido para texto
   const nameElement = document.querySelector('div[role="heading"][aria-level="1"]');
-  const advertiserName = nameElement ? nameElement.innerText.trim() : 'Unknown';
+  const advertiserName = nameElement ? (nameElement.innerText || "").trim() : 'Unknown';
   let adCount = null;
   let extractedSuccessfully = false;
   let rawText = null;
@@ -150,15 +160,12 @@ function injectedGetPageDetailsAndAdCountForEvaluate(offerNameToUse) {
   if (adCountElement && adCountElement.innerText) {
     const textContent = adCountElement.innerText;
     rawText = textContent;
-    // Primeiro tenta "~1,2k" ou "~123,4"
-    let match = textContent.match(/~([0-9.,]+)/);
+    let match = textContent.match(/~\s*([0-9.,]+)/);
     if (!match) {
-      // Fallback para "123 resultados" ou "123 results"
-      match = textContent.match(/([\d,.]+)\s*(resultados|results)/i);
+      match = textContent.match(/([\d\.,\s\u00A0\u202F]+)\s*(resultados|results)/i);
     }
     if (match && match[1]) {
-      // Normaliza removendo separadores (ponto/virgula)
-      const numberString = match[1].replace(/[.,]/g, '');
+      const numberString = match[1].replace(/[.,\s\u00A0\u202F]/g, '');
       const parsedCount = parseInt(numberString, 10);
       if (!isNaN(parsedCount)) {
         adCount = parsedCount;
@@ -176,221 +183,264 @@ function injectedGetPageDetailsAndAdCountForEvaluate(offerNameToUse) {
   };
 }
 
-// Main processing
+// Create and configure contexts pool
+async function createContexts(browser) {
+  const contexts = [];
+  for (let i = 0; i < CONTEXT_POOL_SIZE; i++) {
+    const device = DEVICE_POOL[i % DEVICE_POOL.length] || {};
+    const ua = USER_AGENTS[i % USER_AGENTS.length];
+    const context = await browser.newContext({ ...(device || {}), userAgent: ua });
+    // Abort heavy resources
+    await context.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      if (["image", "stylesheet", "font", "media"].includes(type)) return route.abort();
+      return route.continue();
+    });
+    contexts.push(context);
+  }
+  return contexts;
+}
+
+async function closeContexts(contexts) {
+  for (const ctx of contexts) {
+    try { await ctx.close(); } catch (e) { /* ignore */ }
+  }
+}
+
+// Main worker processing
 async function processOffers(offersSlice) {
-  const browser = await chromium.launch({ headless: true });
+  // Launch browser with safer args for GH Actions
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+
+  const contexts = await createContexts(browser);
   let consecutiveFails = 0;
   let consecutiveSuccess = 0;
 
-  for (let i = 0; i < offersSlice.length; i += PARALLEL) {
-    const batch = offersSlice.slice(i, i + PARALLEL);
-    console.log(`📦 Processando bloco: ${Math.floor(i / PARALLEL) + 1} (${batch.length} ofertas)`);
+  try {
+    for (let i = 0; i < offersSlice.length; i += PARALLEL) {
+      const batch = offersSlice.slice(i, i + PARALLEL);
+      logInfo(`📦 Processando bloco ${Math.floor(i / PARALLEL) + 1} (${batch.length} ofertas) — Worker ${WORKER_INDEX}`);
 
-    await Promise.all(batch.map(async (offer, idxInBatch) => {
-      if (!offer || !offer.adLibraryUrl) return;
-      const globalIndex = i + idxInBatch;
-      const { device, ua } = pickDeviceAndUA(globalIndex);
-      const contextOptions = { ...(device || {}) };
-      if (ua) contextOptions.userAgent = ua;
+      await Promise.all(batch.map(async (offer, idxInBatch) => {
+        if (!offer || !offer.adLibraryUrl) return;
+        const globalIndex = i + idxInBatch;
+        const ctxIndex = globalIndex % CONTEXT_POOL_SIZE;
+        const context = contexts[ctxIndex];
 
-      const context = await browser.newContext(contextOptions);
+        // Create page per offer (cheap)
+        const page = await context.newPage();
+        try {
+          logInfo(`⌛ [${offer.id}] Acessando: ${offer.adLibraryUrl}`);
+          await page.goto(offer.adLibraryUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT }).catch(e => {
+            // fallback to continue — we'll handle error below
+            logWarn(`⚠️ [${offer.id}] goto erro: ${String(e?.message || e)}`);
+          });
 
-      // Abort heavy resources to reduce HTML/RAM load
-      await context.route("**/*", (route) => {
-        const type = route.request().resourceType();
-        if (["image", "stylesheet", "font", "media"].includes(type)) return route.abort();
-        return route.continue();
-      });
-
-      const page = await context.newPage();
-
-      try {
-        console.log(`⌛ [${offer.id}] Acessando (${device?.name || "custom"} / UA=${(ua || "").slice(0,60)}): ${offer.adLibraryUrl}`);
-        await page.goto(offer.adLibraryUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
-
-        // small wait to let on-page JS run if necessary; still small to keep speed
-        await page.waitForTimeout(WAIT_TIME + jitter(800));
-
-        // Try selector-first extraction, with up to RETRY_ATTEMPTS retries
-        let foundCount = null;
-        let foundRawText = null;
-        let attempt = 0;
-        const selectorString = 'text=/' + '(\\d{1,3}(?:[.,]\\d{3})*(?:[.,]\\d+)?)\\s*(?:resultados|results)' + '/i';
-        for (; attempt <= RETRY_ATTEMPTS && foundCount === null; attempt++) {
+          // Prefer networkidle but with a short timeout
           try {
-            // wait for the text matching the regex
-            const locator = page.locator(selectorString).first();
-            await locator.waitFor({ timeout: SELECTOR_TIMEOUT }).catch(() => { /* will handle below */ });
-            const text = await locator.textContent().catch(() => null);
+            await page.waitForLoadState('networkidle', { timeout: Math.min(10000, NAV_TIMEOUT) });
+          } catch (e) {
+            // ignore, some pages don't reach networkidle quickly
+          }
+
+          // small wait to allow inline JS
+          await page.waitForTimeout(WAIT_TIME + jitter(500));
+
+          let foundCount = null;
+          let foundRawText = null;
+
+          // Attempt quick selector-first: heading role=3 (fast)
+          try {
+            const locator = page.locator('div[role="heading"][aria-level="3"]').first();
+            // we try to fetch textContent directly with a small timeout (fast)
+            const text = await locator.textContent({ timeout: SELECTOR_TIMEOUT }).catch(() => null);
             if (text) {
-              const parsed = parseCountFromText(text);
+              const parsed = parseCountFromHeadingText(text);
               if (parsed != null) {
                 foundCount = parsed;
                 foundRawText = text;
-                console.log(`🔎 [${offer.id}] selector found on attempt ${attempt + 1}`);
-                break;
+                logInfo(`🔎 [${offer.id}] heading matched selector-first: ${foundCount}`);
               }
             }
           } catch (e) {
-            // ignore, we'll retry if allowed
+            // ignore selector-first errors
           }
-          if (foundCount === null && attempt < RETRY_ATTEMPTS) {
-            console.log(`· [${offer.id}] selector not found, retry ${attempt + 1}/${RETRY_ATTEMPTS}`);
-            await page.waitForTimeout(1000 + Math.floor(Math.random() * 800));
-          }
-        }
 
-        // If selector-first failed, use the exact method from the extension (in-page evaluate)
-        if (foundCount === null) {
+          // If not found, try frames (some pages render in iframes)
+          if (foundCount === null) {
+            try {
+              for (const frame of page.frames()) {
+                try {
+                  const fText = await frame.locator('div[role="heading"][aria-level="3"]').first().textContent().catch(() => null);
+                  if (fText) {
+                    const parsed = parseCountFromHeadingText(fText);
+                    if (parsed != null) {
+                      foundCount = parsed;
+                      foundRawText = fText;
+                      logInfo(`🔎 [${offer.id}] frame heading matched: ${foundCount}`);
+                      break;
+                    }
+                  }
+                } catch (e) {
+                  // ignore frame errors and continue
+                }
+              }
+            } catch (e) {
+              // no-op
+            }
+          }
+
+          // If still not found, fallback to injected function (replicates extension)
+          if (foundCount === null) {
+            try {
+              const evalRes = await page.evaluate(injectedGetPageDetailsAndAdCountForEvaluate, offer.offerName || "");
+              if (evalRes && evalRes.extractedSuccessfully && typeof evalRes.results === "number") {
+                foundCount = evalRes.results;
+                foundRawText = evalRes.rawText || null;
+                logInfo(`🔁 [${offer.id}] fallback evaluate succeeded: ${foundCount}`);
+              } else {
+                logInfo(`🔁 [${offer.id}] fallback evaluate did not find counter`);
+              }
+            } catch (e) {
+              logWarn(`⚠️ [${offer.id}] evaluate fallback failed: ${String(e?.message || e)}`);
+            }
+          }
+
+          const updated_at = nowIso();
+
+          if (foundCount != null) {
+            const activeAds = foundCount;
+            // Successful extraction: update DB and reset attempts to 0
+            try {
+              const { error } = await supabase
+                .from("swipe_file_offers")
+                .update({ activeAds, updated_at, status_updated: "success", attempts: 0 })
+                .eq("id", offer.id);
+              if (error) {
+                logWarn(`[${offer.id}] Erro ao atualizar DB: ${error.message || error}`);
+              } else {
+                logInfo(`✅ [${offer.id}] atualizado activeAds=${activeAds}`);
+              }
+            } catch (e) {
+              logWarn(`[${offer.id}] Supabase update error: ${String(e?.message || e)}`);
+            }
+            consecutiveSuccess++;
+            consecutiveFails = 0;
+          } else {
+            // Not found: don't write null on first attempts. Increment attempts and only null after MAX_FAILS.
+            logWarn(`❌ [${offer.id}] contador não encontrado — incrementando attempts`);
+            // Save debug HTML only if DEBUG=true
+            try {
+              const html = DEBUG ? await page.content().catch(() => null) : null;
+              if (html) {
+                const dbg = await saveDebugHtml(html, offer.id, "no-counter");
+                if (dbg && dbg.htmlPath) logInfo(`[${offer.id}] debug salvo: ${dbg.htmlPath}`);
+              }
+            } catch (e) {
+              logWarn(`[${offer.id}] falha ao salvar debug: ${String(e?.message || e)}`);
+            }
+
+            const currentAttempts = Number(offer.attempts ?? 0);
+            const newAttempts = currentAttempts + 1;
+
+            try {
+              if (newAttempts >= MAX_FAILS) {
+                const { error } = await supabase
+                  .from("swipe_file_offers")
+                  .update({ activeAds: null, updated_at, status_updated: "no_counter", attempts: newAttempts })
+                  .eq("id", offer.id);
+                if (error) logWarn(`[${offer.id}] DB update (no_counter) error: ${error.message || error}`);
+                else logInfo(`[${offer.id}] marcado no_counter após ${newAttempts} tentativas`);
+              } else {
+                const { error } = await supabase
+                  .from("swipe_file_offers")
+                  .update({ updated_at, status_updated: `no_counter_attempt_${newAttempts}`, attempts: newAttempts })
+                  .eq("id", offer.id);
+                if (error) logWarn(`[${offer.id}] DB update (attempt increment) error: ${error.message || error}`);
+                else logInfo(`[${offer.id}] incrementado attempts -> ${newAttempts}`);
+              }
+            } catch (e) {
+              logWarn(`[${offer.id}] Erro ao atualizar attempts no DB: ${String(e?.message || e)}`);
+            }
+
+            consecutiveFails++;
+          }
+        } catch (err) {
+          logError(`🚫 [${offer.id}] Erro ao processar:`, err?.message || err);
+          // On exception increment attempts similarly to not-found
           try {
-            const evalRes = await page.evaluate(injectedGetPageDetailsAndAdCountForEvaluate, offer.offerName || "");
-            if (evalRes && evalRes.extractedSuccessfully && typeof evalRes.results === "number") {
-              foundCount = evalRes.results;
-              foundRawText = evalRes.rawText || null;
-              console.log(`🔁 [${offer.id}] fallback evaluate succeeded: ${foundCount}`);
+            const currentAttempts = Number(offer.attempts ?? 0);
+            const newAttempts = currentAttempts + 1;
+            if (newAttempts >= MAX_FAILS) {
+              await supabase
+                .from("swipe_file_offers")
+                .update({ activeAds: null, updated_at: nowIso(), status_updated: "error", attempts: newAttempts })
+                .eq("id", offer.id);
+              logWarn(`[${offer.id}] marcado error/no_counter após exception -> attempts ${newAttempts}`);
             } else {
-              console.log(`🔁 [${offer.id}] fallback evaluate did not find counter`);
+              await supabase
+                .from("swipe_file_offers")
+                .update({ updated_at: nowIso(), status_updated: `error_attempt_${newAttempts}`, attempts: newAttempts })
+                .eq("id", offer.id);
+              logWarn(`[${offer.id}] incrementado attempts (exception) -> ${newAttempts}`);
             }
           } catch (e) {
-            console.warn(`⚠️ [${offer.id}] evaluate fallback failed: ${String(e?.message || e)}`);
+            logWarn(`[${offer.id}] DB update (exception) failed: ${String(e?.message || e)}`);
           }
-        }
-
-        const updated_at = nowIso();
-
-        if (foundCount != null) {
-          const activeAds = foundCount;
-          console.log(`✅ [${offer.id}] ${offer.offerName || "offer"}: ${activeAds} anúncios (raw: ${String(foundRawText).slice(0,120)})`);
-
-          // Update in DB: success -> activeAds + attempts reset
-          const { error } = await supabase
-            .from("swipe_file_offers")
-            .update({ activeAds, updated_at, status_updated: "success", attempts: 0 })
-            .eq("id", offer.id);
-          if (error) console.warn(`[${offer.id}] Erro ao atualizar DB:`, error.message || error);
-          consecutiveSuccess++;
-          consecutiveFails = 0;
-        } else {
-          console.warn(`❌ [${offer.id}] contador não encontrado após selector+fallback — salvando debug`);
-
-          // Save debug snapshot for inspection
-          try {
-            const dbg = await saveDebug(page, offer.id, "no-counter-selector-and-fallback");
-            console.log(`[${offer.id}] debug salvo: ${dbg.htmlPath || "no-html"} ${dbg.pngPath || ""}`);
-          } catch (e) {
-            console.warn(`[${offer.id}] falha ao salvar debug:`, e?.message || e);
-          }
-
-          // Determine current attempts (prefer using value from the fetched offer)
-          const currentAttempts = Number(offer.attempts ?? 0);
-          const newAttempts = currentAttempts + 1;
-
-          // If attempts reached MAX_FAILS, mark activeAds = null final; otherwise only increment attempts and mark attempt status
-          if (newAttempts >= MAX_FAILS) {
-            try {
-              const { error } = await supabase
-                .from("swipe_file_offers")
-                .update({ activeAds: null, updated_at, status_updated: "no_counter", attempts: newAttempts })
-                .eq("id", offer.id);
-              if (error) console.warn(`[${offer.id}] DB update (no_counter) error:`, error.message || error);
-              console.log(`[${offer.id}] marcação final no_counter após ${newAttempts} tentativas`);
-            } catch (e) {
-              console.warn(`[${offer.id}] Erro ao gravar no_counter:`, e?.message || e);
-            }
-          } else {
-            try {
-              const { error } = await supabase
-                .from("swipe_file_offers")
-                .update({ updated_at, status_updated: `no_counter_attempt_${newAttempts}`, attempts: newAttempts })
-                .eq("id", offer.id);
-              if (error) console.warn(`[${offer.id}] DB update (attempt increment) error:`, error.message || error);
-              console.log(`[${offer.id}] incrementado attempts -> ${newAttempts} (não sobrescrevendo activeAds)`);
-            } catch (e) {
-              console.warn(`[${offer.id}] Erro ao incrementar attempts:`, e?.message || e);
-            }
-          }
-
           consecutiveFails++;
+        } finally {
+          try { await page.close(); } catch (e) { /* ignore */ }
+          // small delay between pages to avoid burst
+          await sleep(200 + jitter(300));
         }
-      } catch (err) {
-        console.error(`🚫 [${offer.id}] Erro ao processar:`, err?.message || err);
-        // Save debug page content if possible
-        try {
-          const html = await page.content().catch(() => null);
-          if (html) {
-            const dbg = await saveDebug(html, offer.id, `exception-${String(err?.message || err)}`);
-            console.log(`[${offer.id}] debug salvo após exception: ${dbg.htmlPath || "no-html"}`);
-          }
-        } catch (e) {
-          console.warn(`[${offer.id}] falha ao salvar debug na exception:`, e?.message || e);
-        }
-        try {
-          // On exception we increment attempts similar to no-counter flow (avoid immediate null)
-          const currentAttempts = Number(offer.attempts ?? 0);
-          const newAttempts = currentAttempts + 1;
-          if (newAttempts >= MAX_FAILS) {
-            await supabase
-              .from("swipe_file_offers")
-              .update({ activeAds: null, updated_at: nowIso(), status_updated: "error", attempts: newAttempts })
-              .eq("id", offer.id);
-          } else {
-            await supabase
-              .from("swipe_file_offers")
-              .update({ updated_at: nowIso(), status_updated: `error_attempt_${newAttempts}`, attempts: newAttempts })
-              .eq("id", offer.id);
-          }
-        } catch (e) {
-          console.warn(`[${offer.id}] DB update (error) failed:`, e?.message || e);
-        }
-        consecutiveFails++;
-      } finally {
-        try { await page.close(); } catch {}
-        try { await context.close(); } catch {}
-        await sleep(400 + jitter(900));
+      }));
+
+      // adaptive throttling (keep, but conservative)
+      if (consecutiveFails >= 3 && CONTEXT_POOL_SIZE > 1) {
+        // nothing heavy here; we could reduce concurrency externally if needed
+        logWarn("⚠️ Consecutive fails >=3");
+      } else if (consecutiveSuccess >= 20) {
+        consecutiveSuccess = 0;
       }
-    }));
 
-    // adaptive throttling
-    if (consecutiveFails >= 3 && PARALLEL > 3) {
-      PARALLEL = 3;
-      console.log("⚠️ Reduzindo paralelismo para 3.");
-    } else if (consecutiveSuccess >= 20 && PARALLEL < 5) {
-      PARALLEL = 5;
-      console.log("✅ Restaurando paralelismo para 5.");
-      consecutiveSuccess = 0;
+      // small pause between batches
+      await sleep(300 + jitter(600));
     }
-
-    await sleep(500 + jitter(1000));
+  } finally {
+    // close contexts and browser
+    await closeContexts(contexts);
+    try { await browser.close(); } catch (e) { /* ignore */ }
   }
-
-  await browser.close();
 }
 
 (async () => {
-  console.log("🚀 Scraper iniciado (WORKER_INDEX:", WORKER_INDEX, "TOTAL_WORKERS:", TOTAL_WORKERS, "WORKER_ID:", WORKER_ID, ")");
-  ensureDebugDir();
+  logInfo("🚀 Scraper otimizado iniciado", { WORKER_INDEX, TOTAL_WORKERS, WORKER_ID, PARALLEL, CONTEXT_POOL_SIZE });
+  if (DEBUG) ensureDebugDir();
 
   const { data: offers, error } = await supabase.from("swipe_file_offers").select("*");
   if (error) {
-    console.error("❌ Erro ao buscar ofertas:", error);
+    logError("❌ Erro ao buscar ofertas:", error);
     process.exit(1);
   }
   if (!Array.isArray(offers) || offers.length === 0) {
-    console.log("ℹ️ Nenhuma oferta encontrada. Encerrando.");
+    logInfo("ℹ️ Nenhuma oferta encontrada. Encerrando.");
     process.exit(0);
   }
 
   const shuffledOffers = shuffle(offers);
-  console.log(`🚀 Total de ofertas: ${shuffledOffers.length}`);
+  logInfo(`🚀 Total de ofertas (shuffled): ${shuffledOffers.length}`);
 
   const total = shuffledOffers.length;
   const chunkSize = Math.ceil(total / TOTAL_WORKERS);
   let myOffers = shuffledOffers.slice(WORKER_INDEX * chunkSize, Math.min((WORKER_INDEX + 1) * chunkSize, total));
   if (PROCESS_LIMIT) myOffers = myOffers.slice(0, PROCESS_LIMIT);
 
-  console.log(`📂 Worker ${WORKER_INDEX} processando ${myOffers.length} ofertas (chunk size ${chunkSize})`);
+  logInfo(`📂 Worker ${WORKER_INDEX} processando ${myOffers.length} ofertas (chunk size ${chunkSize})`);
   await processOffers(myOffers);
 
-  console.log("✅ Worker finalizado");
+  logInfo("✅ Worker finalizado");
   process.exit(0);
 })();
