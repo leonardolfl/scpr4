@@ -82,7 +82,14 @@ function nowIso() { return new Date().toISOString(); }
 function nowTs() { return new Date().toISOString().replace(/[:.]/g, "-"); }
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function jitter(ms) { return Math.floor(Math.random() * ms); }
-function shuffle(array) { const a = array.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]; } return a; } // note: kept simple
+function shuffle(array) {
+  const a = array.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
 function randProb(p) { return Math.random() < p; }
 
 function logInfo(...args) { if (["info"].includes(LOG_LEVEL)) console.log(...args); }
@@ -472,11 +479,7 @@ async function processOffers(offersSlice) {
   }
 
   // shuffle for distribution
-  const shuffledOffers = offers.slice();
-  for (let i = shuffledOffers.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [shuffledOffers[i], shuffledOffers[j]] = [shuffledOffers[j], shuffledOffers[i]];
-  }
+  const shuffledOffers = shuffle(offers);
 
   const total = shuffledOffers.length;
   const chunkSize = Math.ceil(total / TOTAL_WORKERS);
