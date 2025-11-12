@@ -1,9 +1,6 @@
 name: FB Ads Scraper Diário
 
 on:
-  schedule:
-    # Rodar todo dia às 7h da manhã (UTC-3 → 10h UTC)
-    - cron: '0 10 * * *'
   workflow_dispatch: # permite rodar manualmente
 
 jobs:
