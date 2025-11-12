@@ -1,0 +1,67 @@
+name: Testar Scraper Manual (Facebook Ad Library)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  manual-test-0:
+    name: Worker 0
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repositório
+        uses: actions/checkout@v4
+
+      - name: Instalar dependências
+        run: |
+          npm ci
+          npx playwright install --with-deps
+
+      - name: Rodar Worker 0 (Supabase)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TOTAL_WORKERS: 2
+          WORKER_INDEX: 0
+          DEBUG: true
+        run: |
+          node test_scraper_manual.mjs
+
+      - name: Upload de HTMLs de debug
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug_htmls_worker_0
+          path: debug_manual/
+
+  manual-test-1:
+    name: Worker 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repositório
+        uses: actions/checkout@v4
+
+      - name: Instalar dependências
+        run: |
+          npm ci
+          npx playwright install --with-deps
+
+      - name: Rodar Worker 1 (Supabase)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TOTAL_WORKERS: 2
+          WORKER_INDEX: 1
+          DEBUG: true
+        run: |
+          node test_scraper_manual.mjs
+
+      - name: Upload de HTMLs de debug
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug_htmls_worker_1
+          path: debug_manual/
